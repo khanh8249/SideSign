@@ -323,7 +323,7 @@ jobs:
             unicorn_arch: x86_64
           - arch: armv7
             triple: armv7-unknown-linux-android24
-            unicorn_arch: armv7l
+            unicorn_arch: armeabi-v7a
     steps:
       - uses: actions/checkout@v4
         with:
