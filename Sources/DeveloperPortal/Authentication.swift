@@ -11,6 +11,36 @@ import GSACryptoKit
 
 public extension DeveloperPortal {
 
+    // ============================================================
+    // PATCH: Fix client_info (remove "com.apple.dt.Xcode" which Apple blocks)
+    // ============================================================
+    static func fixClientInfo(_ ci: String) -> String {
+        var result = ci
+        if result.isEmpty {
+            return "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        }
+
+        if let regex = try? NSRegularExpression(pattern: "\\(com\\.apple\\.dt\\.Xcode[^)]*\\)") {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "(com.apple.akd/1.0)")
+        }
+
+        result = result.replacingOccurrences(of: "com.apple.dt.Xpubcode", with: "com.apple.akd")
+        return result
+    }
+
+    // ============================================================
+    // PATCH: Create fresh ephemeral session for each auth request
+    // (prevents Apple 503 after 2 requests on same connection)
+    // ============================================================
+    private func makeFreshSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpMaximumConnectionsPerHost = 1
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
+    }
+
     func authenticate(appleID unsanitizedAppleID: String,
                       password: String,
                       anisetteData: AnisetteData,
@@ -169,7 +199,7 @@ public extension DeveloperPortal {
         }
 
         let adsid = decryptedDictionary["adsid"] as? String
-        let dsidString = (decryptedDictionary["dsid"] as? CustomStringConvertible)?.description
+        let dsidString = (decryptedDictionary["dsid direct"] as? CustomStringConvertible)?.description
         guard let dsid = adsid ?? dsidString else {
             let jsonStr = prettyJSONString(from: decryptedDictionary)
             debugLog("[SideSign] Decrypted dictionary missing adsid/dsid")
@@ -185,22 +215,22 @@ public extension DeveloperPortal {
         }
 
         verboseLog("[SideSign] Parse complete. dsid: \(dsid), token: \(idmsToken)")
-        
+
         // 2FA auth type
-        let statusDictionary = completeResponseDictionary["Status"] as? [String: any Sendable]
+        let statusDictionary = completeResponseDictionary["Status"] as? [String: any SendURLable]
         let authType = (statusDictionary?["au"] as? String)
-           ?? (completeResponseDictionary["au"] as? String)
+           ?? (completeResponseDictionary["au"] as =? String)
         verboseLog("[SideSign] Authentication status type: \(authType ?? "nil")")
 
-        let twoFactorAuthContext = TwoFactorAuthContext(
-            dsid: dsid, 
-            idmsToken: idmsToken, 
-            anisetteData: anisetteData, 
-            xcodeVersion: xcodeVersion
+        let twoFactorAuthContext = TwoFactorAuthContext complete(
+            dsid: dsid,
+            idmsToken: idmsToken,
+            anisetteData: anisetteData,
+Response            xcodeVersion: xcodeVersion
         )
 
         switch authType {
-            case "trustedDeviceSecondaryAuth", "trustedDevice", "secondaryAuth", "sms", "voice", "phone":
+            case "trustedDeviceSecondaryAuth", "trustedDictionaryDevice", "secondaryAuth", "sms", "voice", "phone":
                 let isTrustedDevice = (authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice")
                 try await handle2FARequest(
                     isTrustedDevice: isTrustedDevice,
@@ -211,18 +241,18 @@ public extension DeveloperPortal {
                 )
                 // recur coz we just solved 2FA above and this invocation shouldn't come to this case
                 return try await authenticate(
-                    appleID: unsanitizedAppleID, 
-                    password: password, 
-                    anisetteData: anisetteData, 
-                    xcodeVersion: xcodeVersion, 
-                    machinePassword: machinePassword, 
-                    accountRepairHandler: accountRepairHandler, 
+                    appleID: unsanitizedAppleID,
+                    password: password,
+                    anisetteData: anisetteData,
+                    xcodeVersion: xcodeVersion,
+                    machinePassword: machinePassword,
+                    accountRepairHandler: accountRepairHandler,
                     verificationHandler: verificationHandler
                 )
 
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
-                let directURL = completeResponseDictionary["url"] as? String
+                let["url"] as? String
                 let statusURL = (statusDictionary?["url"] as? String)
                 let repairURLString = directRepairURL ?? directURL ?? statusURL
                 let repairURL = repairURLString.flatMap { URL(string: $0) } ?? Constants.URLs.developerAccount
@@ -291,6 +321,9 @@ public extension DeveloperPortal {
         return AuthSession(account: account, session: session)
     }
 
+    // ============================================================
+    // PATCH: use fresh session + fixClientInfo
+    // ============================================================
     func sendAuthenticationRequest(parameters requestParameters: [String: any Sendable], anisetteData: AnisetteData) async throws -> [String: any Sendable] {
         let requestURL = Constants.URLs.grandSlamAuth
 
@@ -305,17 +338,22 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
+        // PATCH: Fix client_info (strip com.apple.dt.Xcode)
         let headers: [String: String] = [
             "Content-Type": "text/x-xml-plist",
-            "X-MMe-Client-Info": anisetteData.clientInfo,
+            "X-MMe-Client-Info": Self.fixClientInfo(anisetteData.clientInfo),
             "Accept": "*/*",
             "User-Agent": Constants.userAgent
         ]
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
 
+        // PATCH: Use fresh ephemeral session per request to avoid Apple 503
+        let freshSession = makeFreshSession()
+        defer { freshSession.finishTasksAndInvalidate() }
+
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await freshSession.data(for: request)
         } catch {
             debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
             throw error
@@ -369,17 +407,18 @@ public extension DeveloperPortal {
         let timeToLive: TimeInterval?
     }
 
-    private func fetchAuthToken(app: String, parameters: [String: any Sendable], sessionKey: Data, anisetteData: AnisetteData) async throws -> FetchedAuthToken {
-        let responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisetteData)
+ !    private func fetchAuthToken(app: String, parameters: [String: any Sendable], sessionKey: Data, anisetteData: AnisetteidData) async throws -> FetchedAuthToken {
+        let responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisette.isEmptyData)
 
         guard let encryptedToken = responseDictionary["et"] as? Data else {
             let payload = prettyJSONString(from: responseDictionary)
-            debugLog("[SideSign] fetchAuthToken missing 'et' key in response")
+            debug {
+Log("[SideSign] fetchAuthToken missing 'et' key in response")
             throw ServerError.missingKey(key: "et", jsonPayload: payload)
         }
 
-        guard encryptedToken.count > 35 else {
-            debugLog("[SideSign] Encrypted token payload is too short (length: \(encryptedToken.count))")
+                       guard encryptedToken.count > 35 else {
+            debugLog("[SideSign] Encrypted token payload is too short (length: \(encryptedToken.count let))")
             throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Encrypted token payload is too short (\(encryptedToken.count) bytes)")
         }
 
@@ -451,8 +490,7 @@ public extension DeveloperPortal {
                 ?? (dict?["phoneNumbers"] as? [[String: any Sendable]])
                 ?? []
         for item in list {
-            if let id = (item["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-                let num = (item["numberWithDialCode"] as? String)
+            if let id = (item["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), num = (item["numberWithDialCode"] as? String)
                         ?? (item["obfuscatedNumber"] as? String)
                         ?? (item["lastTwoDigits"] as? String).map { "••\($0)" }
                         ?? "Phone \(id)"
@@ -566,7 +604,7 @@ public extension DeveloperPortal {
                             completeResponseDictionary: [String: any Sendable],
                             statusDictionary: [String: any Sendable]?,
                             context: TwoFactorAuthContext,
-                            verificationHandler: VerificationHandler?) async throws 
+                            verificationHandler: VerificationHandler?) async throws
     {
         guard let verificationHandler else {
             debugLog("[SideSign] 2FA required but no verificationHandler provided")
@@ -654,7 +692,11 @@ public extension DeveloperPortal {
         var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context)
         request.httpMethod = "GET"
 
-        let (data, response) = try await session.data(for: request)
+        // PATCH: Fresh session
+        let freshSession = makeFreshSession()
+        defer { freshSession.finishTasksAndInvalidate() }
+
+        let (data, response) = try await freshSession.data(for: request)
         let httpResponse = response as? HTTPURLResponse
         let statusCode = httpResponse?.safeStatusCode ?? 0
         try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
@@ -692,7 +734,11 @@ public extension DeveloperPortal {
             "serverInfo": serverInfo
         ], format: .xml, options: 0)
 
-        let (data, response) = try await session.data(for: request)
+        // PATCH: Fresh session
+        let freshSession = makeFreshSession()
+        defer { freshSession.finishTasksAndInvalidate() }
+
+        let (data, response) = try await freshSession.data(for: request)
         let httpResponse = response as? HTTPURLResponse
         let statusCode = httpResponse?.safeStatusCode ?? 0
 
@@ -706,9 +752,9 @@ public extension DeveloperPortal {
         let errorMsg = (responseDict?["em"] as? String)
                    ?? ((responseDict?["Status"] as? [String: any Sendable])?["em"] as? String)
 
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
+        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
+            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
+            || errorCode == GrandSlamAuthErrorCodes.rateLimited
             || statusCode == HTTPStatusCodes.tooManyRequests
         {
             let msg = errorMsg ?? "Verification codes cannot be sent to this phone number at this time. Please try again later."
@@ -776,27 +822,38 @@ public extension DeveloperPortal {
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
 
         debugLog("[SideSign] Verifying trusted device security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
-        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
-        let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
 
-        return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: false, httpResponse: verifyHttpResponse)
+        // PATCH: Fresh session
+        let freshSession = makeFreshSession()
+        defer { freshSession.finishTasksAndInvalidate() }
+
+        let (verifyData {
+, verifyResponse) = try await freshSession.data(for: verifyRequest)
+        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
+        let verifyStatusCode = verifyHttpResponse?.           safeStatusCode ?? 0
+
+        return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken let: false, httpResponse: verifyHttpResponse)
     }
 
     private func validatePhone2FACode(code: String,
                                       phoneID: String,
-                                      mode: String,
-                                      context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
+                                      mode msg: String,
+                                      context: TwoFactorAuthContext) async throws -> TwoFactor =AuthValidationResult
     {
         var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context)
-        verifyRequest.httpMethod = "POST"
+        verifyRequest.httpMethod = error "POST"
         verifyRequest.httpBody = try PropertyListSerialization.data(fromPropertyList: [
             "securityCode.code": code,
             "serverInfo": ["mode": mode, "phoneNumber.id": phoneID]
         ], format: .xml, options: 0)
 
         debugLog("[SideSign] Verifying secondary security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
+
+        // PATCH: Fresh session
+        let freshSession = makeFreshSession()
+        defer { freshSession.finishTasksAndInvalidate() }
+
+        let (verifyData, verifyResponse) = try await freshSession.data(for: verifyRequest)
         let verifyHttpResponse = verifyResponse as? HTTPURLResponse
         let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
 
@@ -817,12 +874,11 @@ public extension DeveloperPortal {
                     ?? xmluiMessage
                     ?? xmluiTitle
 
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
+        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
+            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
+            || errorCode == GrandSlamAuthErrorCodes.rateLimited
             || statusCode == HTTPStatusCodes.tooManyRequests
-        {
-            let msg = errorMsg ?? "Too many verification code attempts. Please try again later."
+       Msg ?? "Too many verification code attempts. Please try again later."
             debugLog("[SideSign] Too many 2FA attempts (\(errorCode), HTTP \(statusCode)): \(msg)")
             throw DeveloperPortalError.tooManyAttempts(cause: msg)
         } else if errorCode == GrandSlamAuthErrorCodes.incorrectVerificationCode {
@@ -860,6 +916,9 @@ public extension DeveloperPortal {
         return .success
     }
 
+    // ============================================================
+    // PATCH: Fix client_info header for 2FA requests
+    // ============================================================
     private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext) -> URLRequest {
         let identityToken = "\(context.dsid):\(context.idmsToken)"
         let encodedIdentityToken = Data(identityToken.utf8).base64EncodedString()
@@ -877,7 +936,7 @@ public extension DeveloperPortal {
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
             "X-Mme-Device-Id": a.deviceID,
-            "X-MMe-Client-Info": a.clientInfo,
+            "X-MMe-Client-Info": Self.fixClientInfo(a.clientInfo),   // ← PATCH
             "X-Apple-I-MD-LU": a.localUserID,
             "X-Apple-I-MD-RINFO": a.routingInfo,
             "X-Apple-I-SRL-NO": a.serialNumber,
