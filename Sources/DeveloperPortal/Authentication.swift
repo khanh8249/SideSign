@@ -9,7 +9,89 @@
 import Foundation
 import GSACryptoKit
 
+// MARK: - Shared Types
+
+/// Rút gọn cho `[String: any Sendable]` — dùng khắp module auth.
+public typealias SendableDict = [String: any Sendable]
+
+// MARK: - Auth Type
+
+/// Các loại phản hồi `au` từ GrandSlam sau SRP complete.
+enum GrandSlamAuthType: String {
+    case trustedDeviceSecondaryAuth
+    case trustedDevice
+    case secondaryAuth
+    case sms
+    case voice
+    case phone
+    case repair
+
+    var requiresTrustedDevice: Bool {
+        self == .trustedDeviceSecondaryAuth || self == .trustedDevice
+    }
+
+    var requiresSecondaryAuth: Bool {
+        switch self {
+        case .trustedDeviceSecondaryAuth, .trustedDevice,
+             .secondaryAuth, .sms, .voice, .phone:
+            return true
+        case .repair:
+            return false
+        }
+    }
+}
+
+// MARK: - SRP Session Payload
+
+/// Payload giải mã từ `spd` sau SRP complete.
+private struct SRPSessionPayload {
+    let dsid: String
+    let idmsToken: String
+    let sessionKey: Data
+    let challenge: Data
+
+    init(decrypted: SendableDict) throws {
+        guard let dsid = (decrypted["adsid"] as? String)
+                ?? (decrypted["dsid"] as? CustomStringConvertible)?.description
+        else {
+            throw ServerError.missingKey(key: "adsid", jsonPayload: prettyJSONString(from: decrypted))
+        }
+
+        guard let idms = (decrypted["GsIdmsToken"] as? String)
+                ?? (decrypted["idmsToken"] as? String)
+        else {
+            throw ServerError.missingKey(key: "GsIdmsToken", jsonPayload: prettyJSONString(from: decrypted))
+        }
+
+        guard let sk = decrypted["sk"] as? Data else {
+            throw ServerError.missingKey(key: "sk", jsonPayload: prettyJSONString(from: decrypted))
+        }
+
+        guard let c = decrypted["c"] as? Data else {
+            throw ServerError.missingKey(key: "c", jsonPayload: prettyJSONString(from: decrypted))
+        }
+
+        self.dsid = dsid
+        self.idmsToken = idms
+        self.sessionKey = sk
+        self.challenge = c
+    }
+}
+
+// MARK: - Fetched Auth Token
+
+private struct FetchedAuthToken {
+    let token: String
+    let creationDate: Date
+    let expirationDate: Date?
+    let timeToLive: TimeInterval?
+}
+
+// MARK: - Main Extension
+
 public extension DeveloperPortal {
+
+    // MARK: Public Entry
 
     func authenticate(appleID unsanitizedAppleID: String,
                       password: String,
@@ -19,11 +101,77 @@ public extension DeveloperPortal {
                       accountRepairHandler: DeveloperPortal.AccountRepairHandler = DeveloperPortal.defaultAccountRepairHandler,
                       verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession
     {
-        let sanitizedAppleID = unsanitizedAppleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        debugLog("[SideSign] Starting authenticate...")
-        verboseLog("[SideSign] Authenticating Apple ID: \(sanitizedAppleID)")
+        let sanitizedAppleID = unsanitizedAppleID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
 
-        let clientDictionary: [String: any Sendable] = [
+        debugLog("[SideSign] Starting authenticate for \(sanitizedAppleID)")
+        let clientDictionary = makeClientDictionary(anisetteData: anisetteData)
+
+        // Vòng lặp thay cho đệ quy — tránh stack sâu khi 2FA nhiều vòng.
+        while true {
+            let result = try await performSRPHandshake(
+                appleID: sanitizedAppleID,
+                password: password,
+                anisetteData: anisetteData,
+                clientDictionary: clientDictionary
+            )
+
+            let context = TwoFactorAuthContext(
+                dsid: result.payload.dsid,
+                idmsToken: result.payload.idmsToken,
+                anisetteData: anisetteData,
+                xcodeVersion: xcodeVersion
+            )
+
+            if let authType = result.authType, authType.requiresSecondaryAuth {
+                try await handle2FARequest(
+                    isTrustedDevice: authType.requiresTrustedDevice,
+                    response: result.authResponse,
+                    context: context,
+                    verificationHandler: verificationHandler
+                )
+                debugLog("[SideSign] 2FA solved — retrying SRP handshake.")
+                continue // thay vì recursion
+            }
+
+            if result.authType == .repair {
+                try await handleRepair(
+                    response: result.authResponse,
+                    handler: accountRepairHandler
+                )
+            }
+
+            // Fetch app token & account info
+            let fetchedToken = try await fetchAuthToken(
+                app: Constants.authApp,
+                dsid: result.payload.dsid,
+                idmsToken: result.payload.idmsToken,
+                sessionKey: result.payload.sessionKey,
+                challenge: result.payload.challenge,
+                clientDictionary: clientDictionary,
+                anisetteData: anisetteData
+            )
+
+            let session = Session(
+                dsid: result.payload.dsid,
+                authToken: fetchedToken.token,
+                anisetteData: anisetteData,
+                xcodeVersion: xcodeVersion,
+                machinePassword: machinePassword,
+                creationDate: fetchedToken.creationDate,
+                expirationDate: fetchedToken.expirationDate,
+                timeToLive: fetchedToken.timeToLive
+            )
+            let account = try await fetchAccount(session: session)
+            return AuthSession(account: account, session: session)
+        }
+    }
+
+    // MARK: - Client Dictionary
+
+    private func makeClientDictionary(anisetteData: AnisetteData) -> SendableDict {
+        [
             "bootstrap": true,
             "icscrec": true,
             "pbe": false,
@@ -40,832 +188,682 @@ public extension DeveloperPortal {
             "X-Apple-I-Client-Time": anisetteData.clientTime,
             "X-Apple-I-TimeZone": anisetteData.timeZone
         ]
+    }
 
+    // MARK: - SRP Handshake
+
+    private struct SRPHandshakeResult {
+        let payload: SRPSessionPayload
+        let authType: GrandSlamAuthType?
+        let authResponse: SendableDict
+    }
+
+    private func performSRPHandshake(appleID: String,
+                                     password: String,
+                                     anisetteData: AnisetteData,
+                                     clientDictionary: SendableDict) async throws -> SRPHandshakeResult
+    {
+        // 1. SRP init
         guard let srpClient = SRPClient(),
               let publicKey = srpClient.startAuthentication()
         else {
-            debugLog("[SideSign] Failed to start SRPClient / generate public key A")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to start SRPClient / generate public key A")
+            throw DeveloperPortalError.authenticationHandshakeFailed(
+                cause: "Failed to start SRPClient / generate public key A"
+            )
         }
+        verboseLog("[SideSign] Public key A: \(publicKey.hexEncodedString())")
 
-        verboseLog("[SideSign] SRPClient started. Generated public key A: \(publicKey.hexEncodedString())")
-
-        // 1. Send authentication 'init' request
-        let initParameters: [String: any Sendable] = [
-            "A2k": publicKey,
-            "cpd": clientDictionary,
-            "ps": ["s2k", "s2k_fo"],
-            "o": "init",
-            "u": sanitizedAppleID
-        ]
-
-        debugLog("[SideSign] Sending authentication 'init' request...")
-        let initResponse = try await sendAuthenticationRequest(parameters: initParameters, anisetteData: anisetteData)
+        let initResponse = try await sendAuthenticationRequest(
+            parameters: [
+                "A2k": publicKey,
+                "cpd": clientDictionary,
+                "ps": ["s2k", "s2k_fo"],
+                "o": "init",
+                "u": appleID
+            ],
+            anisetteData: anisetteData
+        )
 
         guard let c = initResponse["c"] as? String,
               let salt = initResponse["s"] as? Data,
               let iterations = initResponse["i"] as? Int,
               let serverPublicKey = initResponse["B"] as? Data
         else {
-            let payload = prettyJSONString(from: initResponse)
-            debugLog("[SideSign] Failed to parse authentication init response dictionary: missing c/s/i/B parameters")
-            throw ServerError.badServerResponse(reason: "Auth init response missing c/s/i/B parameters", jsonPayload: payload)
+            throw ServerError.badServerResponse(
+                reason: "Auth init response missing c/s/i/B",
+                jsonPayload: prettyJSONString(from: initResponse)
+            )
         }
 
-        verboseLog("""
-        [SideSign] Received init response:
-          • c: \(c)
-          • sp: \(initResponse["sp"] as? String ?? "nil")
-          • salt: \(salt.hexEncodedString())
-          • iterations: \(iterations)
-          • B: \(serverPublicKey.hexEncodedString())
-        """)
+        // 2. Derive password key
+        let derivedPasswordKey = try derivePasswordKey(
+            password: password,
+            salt: salt,
+            iterations: iterations,
+            useHexDigest: (initResponse["sp"] as? String) == "s2k_fo"
+        )
 
-        let sp = initResponse["sp"] as? String
-        let isHexadecimal = (sp == "s2k_fo")
+        guard let M1 = srpClient.processChallenge(
+            username: appleID,
+            password: derivedPasswordKey,
+            salt: salt,
+            serverPublicKey: serverPublicKey
+        ) else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "SRP challenge processing failed")
+        }
 
+        // 3. SRP complete
+        let completeResponse = try await sendAuthenticationRequest(
+            parameters: [
+                "c": c,
+                "cpd": clientDictionary,
+                "M1": M1,
+                "o": "complete",
+                "u": appleID
+            ],
+            anisetteData: anisetteData
+        )
+
+        guard let spd = completeResponse["spd"] as? Data else {
+            throw ServerError.missingKey(key: "spd", jsonPayload: prettyJSONString(from: completeResponse))
+        }
+        guard let M2 = completeResponse["M2"] as? Data else {
+            throw ServerError.missingKey(key: "M2", jsonPayload: prettyJSONString(from: completeResponse))
+        }
+        guard srpClient.verifyServerProof(M2) else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Server proof (M2) mismatch")
+        }
+        guard let sharedSecret = srpClient.sessionKey() else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Missing SRP session key")
+        }
+
+        // 4. Decrypt SPD
+        guard let spdKey = CryptoUtilities.hmacSHA256(key: sharedSecret, strings: ["extra data key:"]),
+              let spdIV  = CryptoUtilities.hmacSHA256(key: sharedSecret, strings: ["extra data iv:"]),
+              let decrypted = CryptoUtilities.aesCBCDecrypt(key: spdKey, iv: spdIV, ciphertext: spd)
+        else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to decrypt SPD")
+        }
+        guard let dict = parsePlistOrJSON(decrypted) else {
+            throw ServerError.invalidResponseFormat(rawPayload: prettyJSONString(from: decrypted))
+        }
+
+        // 5. Parse + detect auth type
+        let payload = try SRPSessionPayload(decrypted: dict)
+        let statusDict = completeResponse["Status"] as? SendableDict
+        let rawAuthType = (statusDict?["au"] as? String) ?? (completeResponse["au"] as? String)
+        let authType = rawAuthType.flatMap(GrandSlamAuthType.init(rawValue:))
+
+        return SRPHandshakeResult(
+            payload: payload,
+            authType: authType,
+            authResponse: completeResponse
+        )
+    }
+
+    private func derivePasswordKey(password: String,
+                                   salt: Data,
+                                   iterations: Int,
+                                   useHexDigest: Bool) throws -> Data
+    {
         guard let passwordData = password.data(using: .utf8),
-              let digest = CryptoUtilities.sha256(passwordData) else {
-            debugLog("[SideSign] Failed to compute SHA256 of password")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to compute SHA256 of password")
+              let digest = CryptoUtilities.sha256(passwordData)
+        else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "SHA256 failed")
         }
 
-        let inputDigest: Data = isHexadecimal ? Data(digest.hexEncodedString().utf8) : digest
-        guard let derivedPasswordKey = CryptoUtilities.pbkdf2SHA256(
+        let inputDigest: Data = useHexDigest
+            ? Data(digest.hexEncodedString().utf8)
+            : digest
+
+        guard let derived = CryptoUtilities.pbkdf2SHA256(
             password: inputDigest,
             salt: salt,
             rounds: iterations,
             outputLength: digest.count
         ) else {
-            debugLog("[SideSign] Failed to derive PBKDF2 password key")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to derive PBKDF2 password key")
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "PBKDF2 failed")
         }
-
-        guard let verificationMessage = srpClient.processChallenge(
-            username: sanitizedAppleID,
-            password: derivedPasswordKey,
-            salt: salt,
-            serverPublicKey: serverPublicKey
-        ) else {
-            debugLog("[SideSign] SRP challenge processing failed")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "SRP challenge processing failed")
-        }
-
-        debugLog("[SideSign] Initiating SRP authentication step 2 (complete)...")
-        verboseLog("[SideSign] Generated verification message M1: \(verificationMessage.hexEncodedString())")
-
-        // 2. Send authentication 'complete' request
-        let completeParameters: [String: any Sendable] = [
-            "c": c,
-            "cpd": clientDictionary,
-            "M1": verificationMessage,
-            "o": "complete",
-            "u": sanitizedAppleID
-        ]
-
-        let completeResponseDictionary = try await sendAuthenticationRequest(parameters: completeParameters, anisetteData: anisetteData)
-        debugLog("[SideSign] SRP complete step finished.")
-
-        guard let encryptedData = completeResponseDictionary["spd"] as? Data else {
-            let payload = prettyJSONString(from: completeResponseDictionary)
-            debugLog("[SideSign] Missing encrypted data 'spd' in auth complete response: \(payload)")
-            throw ServerError.missingKey(key: "spd", jsonPayload: payload)
-        }
-
-        guard let serverVerificationMessage = completeResponseDictionary["M2"] as? Data else {
-            let payload = prettyJSONString(from: completeResponseDictionary)
-            debugLog("[SideSign] Missing server verification message 'M2' in auth complete response: \(payload)")
-            throw ServerError.missingKey(key: "M2", jsonPayload: payload)
-        }
-
-        verboseLog("""
-        [SideSign] Received SPD payload:
-          • Encrypted SPD bytes: \(encryptedData.count)
-          • M2: \(serverVerificationMessage.hexEncodedString())
-        """)
-
-        guard srpClient.verifyServerProof(serverVerificationMessage) else {
-            debugLog("[SideSign] Server M2 verification message validation failed")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Server verification proof (M2) mismatch")
-        }
-
-        guard let sharedSecret = srpClient.sessionKey() else {
-            debugLog("[SideSign] Failed to obtain session key from SRPClient")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Missing session key")
-        }
-
-        guard let spdKey = CryptoUtilities.hmacSHA256(key: sharedSecret, strings: ["extra data key:"]),
-              let spdIV = CryptoUtilities.hmacSHA256(key: sharedSecret, strings: ["extra data iv:"]),
-              let decryptedData = CryptoUtilities.aesCBCDecrypt(key: spdKey, iv: spdIV, ciphertext: encryptedData)
-        else {
-            debugLog("[SideSign] Decryption of SPD payload failed")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to AES-CBC decrypt SPD payload")
-        }
-
-        guard let decryptedDictionary = parsePlistOrJSON(decryptedData) else {
-            let rawDecrypted = prettyJSONString(from: decryptedData)
-            debugLog("[SideSign] Decrypted payload format is invalid (neither Plist nor JSON)")
-            throw ServerError.invalidResponseFormat(rawPayload: rawDecrypted)
-        }
-
-        let adsid = decryptedDictionary["adsid"] as? String
-        let dsidString = (decryptedDictionary["dsid"] as? CustomStringConvertible)?.description
-        guard let dsid = adsid ?? dsidString else {
-            let jsonStr = prettyJSONString(from: decryptedDictionary)
-            debugLog("[SideSign] Decrypted dictionary missing adsid/dsid")
-            throw ServerError.missingKey(key: "adsid", jsonPayload: jsonStr)
-        }
-
-        let gsIdmsToken = decryptedDictionary["GsIdmsToken"] as? String
-        let rawIdmsToken = decryptedDictionary["idmsToken"] as? String
-        guard let idmsToken = gsIdmsToken ?? rawIdmsToken else {
-            let jsonStr = prettyJSONString(from: decryptedDictionary)
-            debugLog("[SideSign] Decrypted dictionary missing GsIdmsToken/idmsToken")
-            throw ServerError.missingKey(key: "GsIdmsToken", jsonPayload: jsonStr)
-        }
-
-        verboseLog("[SideSign] Parse complete. dsid: \(dsid), token: \(idmsToken)")
-        
-        // 2FA auth type
-        let statusDictionary = completeResponseDictionary["Status"] as? [String: any Sendable]
-        let authType = (statusDictionary?["au"] as? String)
-           ?? (completeResponseDictionary["au"] as? String)
-        verboseLog("[SideSign] Authentication status type: \(authType ?? "nil")")
-
-        let twoFactorAuthContext = TwoFactorAuthContext(
-            dsid: dsid, 
-            idmsToken: idmsToken, 
-            anisetteData: anisetteData, 
-            xcodeVersion: xcodeVersion
-        )
-
-        switch authType {
-            case "trustedDeviceSecondaryAuth", "trustedDevice", "secondaryAuth", "sms", "voice", "phone":
-                let isTrustedDevice = (authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice")
-                try await handle2FARequest(
-                    isTrustedDevice: isTrustedDevice,
-                    completeResponseDictionary: completeResponseDictionary,
-                    statusDictionary: statusDictionary,
-                    context: twoFactorAuthContext,
-                    verificationHandler: verificationHandler
-                )
-                // recur coz we just solved 2FA above and this invocation shouldn't come to this case
-                return try await authenticate(
-                    appleID: unsanitizedAppleID, 
-                    password: password, 
-                    anisetteData: anisetteData, 
-                    xcodeVersion: xcodeVersion, 
-                    machinePassword: machinePassword, 
-                    accountRepairHandler: accountRepairHandler, 
-                    verificationHandler: verificationHandler
-                )
-
-            case "repair":
-                let directRepairURL = completeResponseDictionary["repairUrl"] as? String
-                let directURL = completeResponseDictionary["url"] as? String
-                let statusURL = (statusDictionary?["url"] as? String)
-                let repairURLString = directRepairURL ?? directURL ?? statusURL
-                let repairURL = repairURLString.flatMap { URL(string: $0) } ?? Constants.URLs.developerAccount
-
-                let rawMessage = (statusDictionary?["em"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                let message: String
-                if let rawMessage, !rawMessage.isEmpty {
-                    message = rawMessage
-                } else {
-                    message = Constants.defaultAccountRepairMessage
-                }
-
-                debugLog("[SideSign] Account repair required: \(message) (url: \(repairURL.absoluteString)). Prompting accountRepairHandler...")
-                let decision = try await accountRepairHandler(repairURL, message)
-
-                if decision == .cancel {
-                    debugLog("[SideSign] Account repair cancelled by caller.")
-                    throw DeveloperPortalError.accountRepairRequired(url: repairURL, message: message)
-                }
-
-                debugLog("[SideSign] Account repair acknowledged by caller. Continuing to fetch app tokens...")
-
-            default:
-                break
-        }
-
-        guard let sessionKey = decryptedDictionary["sk"] as? Data else {
-            debugLog("[SideSign] Decrypted dictionary missing 'sk' key for apptokens")
-            throw ServerError.missingKey(key: "sk", jsonPayload: prettyJSONString(from: decryptedDictionary))
-        }
-
-        guard let c = decryptedDictionary["c"] as? Data else {
-            debugLog("[SideSign] Decrypted dictionary missing 'c' key for apptokens")
-            throw ServerError.missingKey(key: "c", jsonPayload: prettyJSONString(from: decryptedDictionary))
-        }
-
-        let app = Constants.authApp
-        guard let checksum = CryptoUtilities.hmacSHA256(key: sessionKey, strings: ["apptokens", dsid, app]) else {
-            debugLog("[SideSign] Failed to compute apptokens checksum")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to compute apptokens checksum")
-        }
-
-        let appTokensParameters: [String: any Sendable] = [
-            "app": [app],
-            "c": c,
-            "checksum": checksum,
-            "cpd": clientDictionary,
-            "o": "apptokens",
-            "t": idmsToken,
-            "u": dsid
-        ]
-
-        let fetchedToken = try await fetchAuthToken(app: app, parameters: appTokensParameters, sessionKey: sessionKey, anisetteData: anisetteData)
-        let session = Session(
-            dsid: dsid,
-            authToken: fetchedToken.token,
-            anisetteData: anisetteData,
-            xcodeVersion: xcodeVersion,
-            machinePassword: machinePassword,
-            creationDate: fetchedToken.creationDate,
-            expirationDate: fetchedToken.expirationDate,
-            timeToLive: fetchedToken.timeToLive
-        )
-        let account = try await fetchAccount(session: session)
-        return AuthSession(account: account, session: session)
+        return derived
     }
 
-    func sendAuthenticationRequest(parameters requestParameters: [String: any Sendable], anisetteData: AnisetteData) async throws -> [String: any Sendable] {
-        let requestURL = Constants.URLs.grandSlamAuth
+    // MARK: - Repair Flow
 
-        let parameters: [String: any Sendable] = [
+    private func handleRepair(response: SendableDict,
+                              handler: DeveloperPortal.AccountRepairHandler) async throws
+    {
+        let statusDict = response["Status"] as? SendableDict
+        let rawURL = (response["repairUrl"] as? String)
+                  ?? (response["url"] as? String)
+                  ?? (statusDict?["url"] as? String)
+        let url = rawURL.flatMap(URL.init(string:)) ?? Constants.URLs.developerAccount
+        let rawMessage = (statusDict?["em"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = (rawMessage?.isEmpty == false ? rawMessage : nil)
+                   ?? Constants.defaultAccountRepairMessage
+
+        debugLog("[SideSign] Account repair required: \(message) — url: \(url)")
+        let decision = try await handler(url, message)
+
+        if decision == .cancel {
+            throw DeveloperPortalError.accountRepairRequired(url: url, message: message)
+        }
+        debugLog("[SideSign] Account repair acknowledged.")
+    }
+
+    // MARK: - App Token
+
+    /// Layout của token Apple: `[3-byte AAD][16-byte nonce][ciphertext][16-byte tag]`
+    private static let gcmAADLength = 3
+    private static let gcmNonceLength = 16
+    private static let gcmTagLength = 16
+
+    private func fetchAuthToken(app: String,
+                                dsid: String,
+                                idmsToken: String,
+                                sessionKey: Data,
+                                challenge: Data,
+                                clientDictionary: SendableDict,
+                                anisetteData: AnisetteData) async throws -> FetchedAuthToken
+    {
+        guard let checksum = CryptoUtilities.hmacSHA256(
+            key: sessionKey,
+            strings: ["apptokens", dsid, app]
+        ) else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "apptokens checksum failed")
+        }
+
+        let response = try await sendAuthenticationRequest(
+            parameters: [
+                "app": [app],
+                "c": challenge,
+                "checksum": checksum,
+                "cpd": clientDictionary,
+                "o": "apptokens",
+                "t": idmsToken,
+                "u": dsid
+            ],
+            anisetteData: anisetteData
+        )
+
+        let token = try decryptAuthToken(response: response, sessionKey: sessionKey, app: app)
+        return try parseAuthTokenMetadata(token: token, app: app)
+    }
+
+    private func decryptAuthToken(response: SendableDict,
+                                  sessionKey: Data,
+                                  app: String) throws -> SendableDict
+    {
+        guard let et = response["et"] as? Data else {
+            throw ServerError.missingKey(key: "et", jsonPayload: prettyJSONString(from: response))
+        }
+
+        let headerLen = Self.gcmAADLength + Self.gcmNonceLength
+        let minLen = headerLen + Self.gcmTagLength
+        guard et.count > minLen else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(
+                cause: "Encrypted token too short (\(et.count) bytes)"
+            )
+        }
+
+        let aad        = et.subdata(in: 0..<Self.gcmAADLength)
+        let nonce      = et.subdata(in: Self.gcmAADLength..<headerLen)
+        let tagStart   = et.count - Self.gcmTagLength
+        let ciphertext = et.subdata(in: headerLen..<tagStart)
+        let tag        = et.subdata(in: tagStart..<et.count)
+
+        guard let plaintext = CryptoUtilities.aesGCMDecrypt(
+            key: sessionKey, nonce: nonce, aad: aad, ciphertext: ciphertext, tag: tag
+        ) else {
+            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "AES-GCM decrypt failed")
+        }
+
+        guard let dict = parsePlistOrJSON(plaintext) else {
+            throw ServerError.invalidResponseFormat(rawPayload: prettyJSONString(from: plaintext))
+        }
+        return dict
+    }
+
+    private func parseAuthTokenMetadata(token dict: SendableDict, app: String) throws -> FetchedAuthToken {
+        guard let appTokens = dict["t"] as? SendableDict,
+              let tokens = appTokens[app] as? SendableDict,
+              let authToken = tokens["token"] as? String
+        else {
+            throw ServerError.missingKey(key: "t/\(app)/token", jsonPayload: prettyJSONString(from: dict))
+        }
+
+        let now = Date()
+        let (expiry, ttl) = Self.extractExpiry(from: tokens, now: now)
+
+        let ttlDesc = ttl.map {
+            "\(Int($0 / 86400))d \(Int($0.truncatingRemainder(dividingBy: 86400) / 3600))h"
+        } ?? "n/a"
+        debugLog("[SideSign] Got token for \(app) — TTL: \(ttlDesc)")
+
+        return FetchedAuthToken(
+            token: authToken,
+            creationDate: now,
+            expirationDate: expiry,
+            timeToLive: ttl
+        )
+    }
+
+    private static func extractExpiry(from tokens: SendableDict,
+                                      now: Date) -> (Date?, TimeInterval?) {
+        let iso = ISO8601DateFormatter()
+
+        if let d = tokens["expiry"] as? Date { return (d, d.timeIntervalSince(now)) }
+        if let s = tokens["expiry"] as? String, let d = iso.date(from: s) { return (d, d.timeIntervalSince(now)) }
+        if let d = tokens["expiry-date"] as? Date { return (d, d.timeIntervalSince(now)) }
+        if let s = tokens["expiry-date"] as? String, let d = iso.date(from: s) { return (d, d.timeIntervalSince(now)) }
+        if let ttl = (tokens["ttl"] as? Double) ?? (tokens["ttl"] as? Int).map(Double.init) {
+            return (now.addingTimeInterval(ttl), ttl)
+        }
+        return (nil, nil)
+    }
+
+    // MARK: - GrandSlam HTTP
+
+    func sendAuthenticationRequest(parameters requestParameters: SendableDict,
+                                   anisetteData: AnisetteData) async throws -> SendableDict
+    {
+        let body: SendableDict = [
             "Header": ["Version": Constants.grandSlamAuthHeader],
             "Request": requestParameters
         ]
 
-        let plistData = try PropertyListSerialization.data(fromPropertyList: parameters, format: .xml, options: 0)
-
-        var request = URLRequest(url: requestURL)
+        var request = URLRequest(url: Constants.URLs.grandSlamAuth)
         request.httpMethod = "POST"
-        request.httpBody = plistData
+        request.httpBody = try PropertyListSerialization.data(
+            fromPropertyList: body, format: .xml, options: 0
+        )
+        request.setValue("text/x-xml-plist", forHTTPHeaderField: "Content-Type")
+        request.setValue(anisetteData.clientInfo, forHTTPHeaderField: "X-MMe-Client-Info")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue(Constants.userAgent, forHTTPHeaderField: "User-Agent")
 
-        let headers: [String: String] = [
-            "Content-Type": "text/x-xml-plist",
-            "X-MMe-Client-Info": anisetteData.clientInfo,
-            "Accept": "*/*",
-            "User-Agent": Constants.userAgent
-        ]
-        headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
-
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
-            throw error
-        }
-
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.statusCode ?? 0
+        let (data, response) = try await session.data(for: request)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
         guard !data.isEmpty else {
-            debugLog("[SideSign] Auth endpoint returned 0 bytes (HTTP \(statusCode))")
-            throw ServerError.badServerResponse(reason: "Auth endpoint returned empty response (0 bytes)", jsonPayload: "0 bytes")
+            throw ServerError.badServerResponse(
+                reason: "Auth endpoint returned empty (HTTP \(statusCode))",
+                jsonPayload: "0 bytes"
+            )
+        }
+        guard let parsed = parsePlistOrJSON(data) else {
+            let raw = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
+            throw ServerError.invalidResponseFormat(rawPayload: raw)
         }
 
-        guard let responseDictionary = parsePlistOrJSON(data) else {
-            let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
-            debugLog("[SideSign] Auth endpoint returned invalid response format: \(rawStr)")
-            throw ServerError.invalidResponseFormat(rawPayload: rawStr)
-        }
-
-        let dictionary = (responseDictionary["Response"] as? [String: any Sendable]) ?? responseDictionary
-        guard let status = dictionary["Status"] as? [String: any Sendable] else {
-            let rawStr = prettyJSONString(from: responseDictionary)
-            debugLog("[SideSign] Auth endpoint response missing 'Status': \(rawStr)")
-            throw ServerError.missingKey(key: "Status", jsonPayload: rawStr)
+        let dict = (parsed["Response"] as? SendableDict) ?? parsed
+        guard let status = dict["Status"] as? SendableDict else {
+            throw ServerError.missingKey(key: "Status", jsonPayload: prettyJSONString(from: parsed))
         }
 
         let errorCode = status["ec"] as? Int ?? 0
         if errorCode != 0 {
-            let errorDesc = status["em"] as? String
-            debugLog("[SideSign] Auth endpoint returned error code \(errorCode): \(errorDesc ?? "No error message")")
-            switch errorCode {
-            case GrandSlamAuthErrorCodes.incorrectCredentials:
-                throw DeveloperPortalError.incorrectCredentials(cause: errorDesc)
-            case GrandSlamAuthErrorCodes.appSpecificPasswordRequired,
-                 GrandSlamAuthErrorCodes.appSpecificPasswordRequiredFallback:
-                throw DeveloperPortalError.appSpecificPasswordRequired(cause: errorDesc)
-            case GrandSlamAuthErrorCodes.incorrectVerificationCode:
-                throw DeveloperPortalError.incorrectVerificationCode(cause: errorDesc)
-            default:
-                throw ServerError.underlyingError(code: errorCode, message: errorDesc ?? "Authentication failed")
-            }
+            throw mapAuthError(code: errorCode, message: status["em"] as? String)
         }
-
-        return dictionary
+        return dict
     }
 
-    private struct FetchedAuthToken {
-        let token: String
-        let creationDate: Date
-        let expirationDate: Date?
-        let timeToLive: TimeInterval?
-    }
-
-    private func fetchAuthToken(app: String, parameters: [String: any Sendable], sessionKey: Data, anisetteData: AnisetteData) async throws -> FetchedAuthToken {
-        let responseDictionary = try await sendAuthenticationRequest(parameters: parameters, anisetteData: anisetteData)
-
-        guard let encryptedToken = responseDictionary["et"] as? Data else {
-            let payload = prettyJSONString(from: responseDictionary)
-            debugLog("[SideSign] fetchAuthToken missing 'et' key in response")
-            throw ServerError.missingKey(key: "et", jsonPayload: payload)
-        }
-
-        guard encryptedToken.count > 35 else {
-            debugLog("[SideSign] Encrypted token payload is too short (length: \(encryptedToken.count))")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Encrypted token payload is too short (\(encryptedToken.count) bytes)")
-        }
-
-        let aad = Data(encryptedToken[..<3])
-        let nonce = Data(encryptedToken[3..<19])
-        let ciphertext = Data(encryptedToken[19..<(encryptedToken.count - 16)])
-        let tag = Data(encryptedToken[(encryptedToken.count - 16)...])
-
-        guard let token = CryptoUtilities.aesGCMDecrypt(key: sessionKey, nonce: nonce, aad: aad, ciphertext: ciphertext, tag: tag) else {
-            debugLog("[SideSign] Failed to AES-GCM decrypt auth token")
-            throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Failed to AES-GCM decrypt auth token")
-        }
-
-        guard let tokensDictionary = parsePlistOrJSON(token) else {
-            let rawStr = prettyJSONString(from: token)
-            debugLog("[SideSign] Failed to parse decrypted token dictionary")
-            throw ServerError.invalidResponseFormat(rawPayload: rawStr)
-        }
-
-        guard let appTokens = tokensDictionary["t"] as? [String: any Sendable],
-              let tokens = appTokens[app] as? [String: any Sendable],
-              let authToken = tokens["token"] as? String
-        else {
-            let payload = prettyJSONString(from: tokensDictionary)
-            debugLog("[SideSign] Decrypted tokens missing t/\(app)/token")
-            throw ServerError.missingKey(key: "t/\(app)/token", jsonPayload: payload)
-        }
-
-        verboseLog("[SideSign] Decrypted GrandSlam response: \(prettyJSONString(from: sanitizeTokens(tokensDictionary)))")
-
-        let now = Date()
-        var expirationDate: Date? = nil
-        var timeToLive: TimeInterval? = nil
-
-        if let expiry = tokens["expiry"] as? Date {
-            expirationDate = expiry
-            timeToLive = expiry.timeIntervalSince(now)
-        } else if let expiryStr = tokens["expiry"] as? String, let parsed = ISO8601DateFormatter().date(from: expiryStr) {
-            expirationDate = parsed
-            timeToLive = parsed.timeIntervalSince(now)
-        } else if let ttl = tokens["ttl"] as? Double ?? (tokens["ttl"] as? Int).map(Double.init) {
-            timeToLive = ttl
-            expirationDate = now.addingTimeInterval(ttl)
-        } else if let exp = tokens["expiry-date"] as? Date {
-            expirationDate = exp
-            timeToLive = exp.timeIntervalSince(now)
-        } else if let expStr = tokens["expiry-date"] as? String, let parsed = ISO8601DateFormatter().date(from: expStr) {
-            expirationDate = parsed
-            timeToLive = parsed.timeIntervalSince(now)
-        }
-
-        let ttlDesc: String
-        if let ttl = timeToLive {
-            let days = Int(ttl / 86400)
-            let hours = Int((ttl.truncatingRemainder(dividingBy: 86400)) / 3600)
-            ttlDesc = "\(days)d \(hours)h (\(Int(ttl))s)"
-        } else {
-            ttlDesc = "unspecified"
-        }
-
-        let expiryDesc = expirationDate.map { ISO8601DateFormatter().string(from: $0) } ?? "unspecified"
-        debugLog("[SideSign] Successfully obtained auth token for app: \(app) (TTL: \(ttlDesc), Expiry: \(expiryDesc))")
-        return FetchedAuthToken(token: authToken, creationDate: now, expirationDate: expirationDate, timeToLive: timeToLive)
-    }
-
-    private func parseTrustedPhoneNumbers(from dict: [String: any Sendable]?) -> [TrustedPhoneNumber] {
-        var results: [TrustedPhoneNumber] = []
-        let list = (dict?["trustedPhoneNumbers"] as? [[String: any Sendable]])
-                ?? (dict?["phoneNumbers"] as? [[String: any Sendable]])
-                ?? []
-        for item in list {
-            if let id = (item["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-                let num = (item["numberWithDialCode"] as? String)
-                        ?? (item["obfuscatedNumber"] as? String)
-                        ?? (item["lastTwoDigits"] as? String).map { "••\($0)" }
-                        ?? "Phone \(id)"
-                results.append(TrustedPhoneNumber(id: id, number: num))
-            }
-        }
-        if results.isEmpty, let single = dict?["phoneNumber"] as? [String: any Sendable],
-           let id = (single["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
-            let num = (single["numberWithDialCode"] as? String)
-                    ?? (single["obfuscatedNumber"] as? String)
-                    ?? (single["lastTwoDigits"] as? String).map { "••\($0)" }
-                    ?? "Phone \(id)"
-            results.append(TrustedPhoneNumber(id: id, number: num))
-        }
-        return results
-    }
-
-    private func parseXMLUIAlertMessage(from data: Data) -> (title: String?, message: String?) {
-        guard let str = String(data: data, encoding: .utf8) else { return (nil, nil) }
-        if str.contains("<pinView") {
-            return (nil, nil)
-        }
-        guard let alertTagRange = str.range(of: #"<alert(?![^>]*\bid=)[^>]*>"#, options: .regularExpression) else {
-            return (nil, nil)
-        }
-        let alertTag = String(str[alertTagRange])
-        var title: String?
-        var message: String?
-        if let titleRange = alertTag.range(of: #"(?<=title=")[^"]+"#, options: .regularExpression) {
-            title = String(alertTag[titleRange])
-        }
-        if let msgRange = alertTag.range(of: #"(?<=message=")[^"]+"#, options: .regularExpression) {
-            message = String(alertTag[msgRange])
-        }
-        return (title, message)
-    }
-
-    private func parseXMLUIServerInfo(from data: Data) -> (phoneID: String?, mode: String?) {
-        guard let str = String(data: data, encoding: .utf8) else { return (nil, nil) }
-        guard let range = str.range(of: #"<serverInfo[^>]*>"#, options: .regularExpression) else { return (nil, nil) }
-        let tag = String(str[range])
-        var phoneID: String?
-        var mode: String?
-        if let idRange = tag.range(of: #"(?<=phoneNumber\.id=")[^"]+"#, options: .regularExpression) {
-            phoneID = String(tag[idRange])
-        }
-        if let modeRange = tag.range(of: #"(?<=mode=")[^"]+"#, options: .regularExpression) {
-            mode = String(tag[modeRange])
-        }
-        return (phoneID, mode)
-    }
-
-    private func throwIfXMLUIErrorAlert(in data: Data, statusCode: Int, actionName: String) throws {
-        let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
-        if xmluiTitle != nil || xmluiMessage != nil {
-            let alertMsg = [xmluiTitle, xmluiMessage]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: ": ")
-            debugLog("[SideSign] \(actionName) alert from Apple (HTTP \(statusCode)): \(alertMsg)")
-            throw DeveloperPortalError.invalid2FAResponse(cause: xmluiMessage ?? alertMsg)
+    private func mapAuthError(code: Int, message: String?) -> Error {
+        debugLog("[SideSign] Auth error \(code): \(message ?? "no message")")
+        switch code {
+        case GrandSlamAuthErrorCodes.incorrectCredentials:
+            return DeveloperPortalError.incorrectCredentials(cause: message)
+        case GrandSlamAuthErrorCodes.appSpecificPasswordRequired,
+             GrandSlamAuthErrorCodes.appSpecificPasswordRequiredFallback:
+            return DeveloperPortalError.appSpecificPasswordRequired(cause: message)
+        case GrandSlamAuthErrorCodes.incorrectVerificationCode:
+            return DeveloperPortalError.incorrectVerificationCode(cause: message)
+        default:
+            return ServerError.underlyingError(code: code, message: message ?? "Auth failed")
         }
     }
 
-    private func parseXMLUIObfuscatedNumber(from data: Data) -> String? {
-        guard let str = String(data: data, encoding: .utf8) else { return nil }
-        let patterns = [
-            #"(?:to|at)\s+([+•\d\s\(\)-]{4,25})[.\s<]"#,
-            #"([+•\d\s\(\)-]*[•]+[+•\d\s\(\)-]*)"#
-        ]
-        for pattern in patterns {
-            if let matchRange = str.range(of: pattern, options: .regularExpression) {
-                let matched = String(str[matchRange])
-                    .replacingOccurrences(of: "to ", with: "")
-                    .replacingOccurrences(of: "at ", with: "")
-                    .trimmingCharacters(in: CharacterSet(charactersIn: ". <\n\r\t"))
-                if matched.contains("•") && matched.count >= 3 {
-                    return matched
-                }
-            }
-        }
-        return nil
-    }
+    // MARK: - Parsing Helpers
 
-    private struct TwoFactorAuthContext {
+    private func parsePlistOrJSON(_ data: Data) -> SendableDict? {
+        (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? SendableDict
+        ?? (try? JSONSerialization.jsonObject(with: data, options: [])) as? SendableDict
+    }
+}
+
+// MARK: - 2FA Context & Models
+
+extension DeveloperPortal {
+
+    struct TwoFactorAuthContext {
         let dsid: String
         let idmsToken: String
         let anisetteData: AnisetteData
         let xcodeVersion: String
     }
 
-    private struct TwoFactorAuthPhoneCodeResponse {
+    private struct PhoneCodeResponse {
         let phoneID: String
         let activeMode: String
         let phoneNumbers: [TrustedPhoneNumber]
-        let statusCode: Int
     }
 
-    private enum TwoFactorAuthChannel {
+    fileprivate enum Channel {
         case trustedDevice
         case sms(phoneID: String)
         case voice(phoneID: String)
     }
 
-    private enum TwoFactorAuthValidationResult {
+    fileprivate enum ValidationResult {
         case success
         case retry(message: String)
     }
 
-    private func handle2FARequest(isTrustedDevice: Bool,
-                            completeResponseDictionary: [String: any Sendable],
-                            statusDictionary: [String: any Sendable]?,
-                            context: TwoFactorAuthContext,
-                            verificationHandler: VerificationHandler?) async throws 
+    /// Chặn brute-force 2FA — tránh Apple lock tài khoản.
+    fileprivate static let max2FARetries = 5
+}
+
+// MARK: - 2FA Flow
+
+extension DeveloperPortal {
+
+    func handle2FARequest(isTrustedDevice: Bool,
+                          response: SendableDict,
+                          context: TwoFactorAuthContext,
+                          verificationHandler: VerificationHandler?) async throws
     {
         guard let verificationHandler else {
-            debugLog("[SideSign] 2FA required but no verificationHandler provided")
             throw DeveloperPortalError.requiresTwoFactorAuthentication
         }
 
-        var phoneNumbers = parseTrustedPhoneNumbers(from: completeResponseDictionary)
-        if phoneNumbers.isEmpty, let statusDictionary {
-            phoneNumbers = parseTrustedPhoneNumbers(from: statusDictionary)
-        }
+        var phoneNumbers = parseTrustedPhoneNumbers(from: response)
+            ?? parseTrustedPhoneNumbers(from: response["Status"] as? SendableDict)
+            ?? []
 
-        let preferredMode: TwoFactorDeliveryMode = isTrustedDevice ? .trustedDevice : .sms
-
-        var currentRequest: TwoFactorRequest = .selectDeliveryMethod(
-            preferredMode: preferredMode,
+        var currentRequest = TwoFactorRequest.selectDeliveryMethod(
+            preferredMode: isTrustedDevice ? .trustedDevice : .sms,
             phoneNumbers: phoneNumbers
         )
-        var activeChannel: TwoFactorAuthChannel? = nil
+        var activeChannel: Channel?
+        var attempts = 0
 
-        while true {
-            debugLog("[SideSign] Prompting user with 2FA request (\(currentRequest))...")
-            let response = try await verificationHandler(currentRequest)
+        while attempts < Self.max2FARetries {
+            debugLog("[SideSign] 2FA prompt: \(currentRequest)")
 
-            switch response {
-                case .requestTrustedDevice:
-                    try await sendTrustedDevice2FACodeRequest(context: context)
-                    activeChannel = .trustedDevice
-                    currentRequest = .trustedDevice(error: nil)
+            switch try await verificationHandler(currentRequest) {
+            case .requestTrustedDevice:
+                try await sendTrustedDeviceCode(context: context)
+                activeChannel = .trustedDevice
+                currentRequest = .trustedDevice(error: nil)
 
-                case .requestSMS(let targetPhoneID):
-                    let result = try await sendPhone2FACodeRequest(mode: "sms", phoneID: targetPhoneID, knownPhoneNumbers: phoneNumbers, context: context)
-                    phoneNumbers = result.phoneNumbers
-                    activeChannel = .sms(phoneID: result.phoneID)
-                    currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
+            case .requestSMS(let id):
+                let r = try await sendPhoneCode(mode: "sms", phoneID: id, known: phoneNumbers, context: context)
+                phoneNumbers = r.phoneNumbers
+                activeChannel = .sms(phoneID: r.phoneID)
+                currentRequest = .sms(phoneNumbers: r.phoneNumbers, activeID: r.phoneID, error: nil)
 
-                case .requestVoice(let targetPhoneID):
-                    let result = try await sendPhone2FACodeRequest(mode: "voice", phoneID: targetPhoneID, knownPhoneNumbers: phoneNumbers, context: context)
-                    phoneNumbers = result.phoneNumbers
-                    activeChannel = .voice(phoneID: result.phoneID)
-                    currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
+            case .requestVoice(let id):
+                let r = try await sendPhoneCode(mode: "voice", phoneID: id, known: phoneNumbers, context: context)
+                phoneNumbers = r.phoneNumbers
+                activeChannel = .voice(phoneID: r.phoneID)
+                currentRequest = .voice(phoneNumbers: r.phoneNumbers, activeID: r.phoneID, error: nil)
 
-                case .verificationCode(let code):
-                    guard let channel = activeChannel else {
-                        debugLog("[SideSign] Unexpected verification code returned before delivery method was selected.")
-                        throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Unexpected verification code returned before a delivery method was selected.")
-                    }
+            case .verificationCode(let code):
+                guard let channel = activeChannel else {
+                    throw DeveloperPortalError.authenticationHandshakeFailed(
+                        cause: "Verification code before selecting a delivery method"
+                    )
+                }
 
-                    let result: TwoFactorAuthValidationResult
-                    switch channel {
-                        case .trustedDevice:
-                            result = try await validateTrustedDevice2FACode(code: code, context: context)
-                        case .sms(let phoneID):
-                            result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "sms", context: context)
-                        case .voice(let phoneID):
-                            result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "voice", context: context)
-                    }
+                let result = try await validate(code: code, channel: channel, context: context)
+                switch result {
+                case .success:
+                    debugLog("[SideSign] 2FA success.")
+                    return
+                case .retry(let msg):
+                    attempts += 1
+                    debugLog("[SideSign] 2FA retry (\(attempts)/\(Self.max2FARetries)): \(msg)")
+                    currentRequest = makeRetryRequest(
+                        channel: channel,
+                        phones: phoneNumbers,
+                        error: msg
+                    )
+                }
 
-                    switch result {
-                        case .success:
-                            debugLog("[SideSign] 2FA code verified successfully!")
-                            return
-                        case .retry(let message):
-                            debugLog("[SideSign] 2FA verification failed, retrying: \(message)")
-                            switch channel {
-                                case .trustedDevice:
-                                    currentRequest = .trustedDevice(error: message)
-                                case .sms(let phoneID):
-                                    currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: message)
-                                case .voice(let phoneID):
-                                    currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: message)
-                            }
-                    }
-
-                case .cancel:
-                    debugLog("[SideSign] User cancelled 2FA.")
-                    throw DeveloperPortalError.userCancelled
+            case .cancel:
+                throw DeveloperPortalError.userCancelled
             }
         }
+
+        throw DeveloperPortalError.tooManyAttempts(
+            cause: "Exceeded \(Self.max2FARetries) 2FA attempts"
+        )
     }
 
-    private func sendTrustedDevice2FACodeRequest(context: TwoFactorAuthContext) async throws {
-        debugLog("[SideSign] Requesting trusted device 2FA code...")
-        verboseLog("[SideSign] sendTrustedDevice2FACodeRequest for dsid: \(context.dsid)")
-
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context)
-        request.httpMethod = "GET"
-
-        let (data, response) = try await session.data(for: request)
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.safeStatusCode ?? 0
-        try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
-
-        guard statusCode == HTTPStatusCodes.ok else {
-            let rawStr = prettyJSONString(from: data)
-            debugLog("[SideSign] sendTrustedDevice2FACodeRequest failed (HTTP \(statusCode)): \(rawStr)")
-            throw ServerError.badServerResponse(reason: "Trusted device request failed (HTTP \(statusCode))", jsonPayload: rawStr)
+    private func makeRetryRequest(channel: Channel,
+                                  phones: [TrustedPhoneNumber],
+                                  error: String) -> TwoFactorRequest
+    {
+        switch channel {
+        case .trustedDevice:  return .trustedDevice(error: error)
+        case .sms(let id):    return .sms(phoneNumbers: phones, activeID: id, error: error)
+        case .voice(let id):  return .voice(phoneNumbers: phones, activeID: id, error: error)
         }
     }
 
-    private func sendPhone2FACodeRequest(mode requestedMode: String,
-                                      phoneID requestedPhoneID: String? = nil,
-                                      knownPhoneNumbers: [TrustedPhoneNumber] = [],
-                                      context: TwoFactorAuthContext) async throws -> TwoFactorAuthPhoneCodeResponse
+    private func validate(code: String,
+                          channel: Channel,
+                          context: TwoFactorAuthContext) async throws -> ValidationResult
     {
-        debugLog("[SideSign] Requesting secondary/phone 2FA code (mode: \(requestedMode), phoneID: \(requestedPhoneID ?? "auto"))...")
-        verboseLog("[SideSign] sendPhone2FACodeRequest for dsid: \(context.dsid), requestedMode: \(requestedMode), phoneID: \(requestedPhoneID ?? "nil")")
+        switch channel {
+        case .trustedDevice:
+            var req = make2FARequest(url: Constants.URLs.grandSlamValidate, context: context)
+            req.setValue(code, forHTTPHeaderField: "security-code")
+            let (data, resp) = try await session.data(for: req)
+            return try parseVerifyResponse(
+                data: data,
+                statusCode: (resp as? HTTPURLResponse)?.safeStatusCode ?? 0,
+                requirePeToken: false,
+                response: resp as? HTTPURLResponse
+            )
 
-        let sanitizedPhoneID: String = {
-            if let id = requestedPhoneID?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+        case .sms(let phoneID):
+            return try await validatePhone(code: code, phoneID: phoneID, mode: "sms", context: context)
+
+        case .voice(let phoneID):
+            return try await validatePhone(code: code, phoneID: phoneID, mode: "voice", context: context)
+        }
+    }
+
+    // MARK: - Send Code
+
+    private func sendTrustedDeviceCode(context: TwoFactorAuthContext) async throws {
+        var req = make2FARequest(url: Constants.URLs.trustedDevice, context: context)
+        req.httpMethod = "GET"
+
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.safeStatusCode ?? 0
+        try throwIfXMLUIErrorAlert(in: data, statusCode: code, actionName: "trustedDevice")
+
+        guard code == HTTPStatusCodes.ok else {
+            throw ServerError.badServerResponse(
+                reason: "Trusted device request failed (HTTP \(code))",
+                jsonPayload: prettyJSONString(from: data)
+            )
+        }
+    }
+
+    private func sendPhoneCode(mode: String,
+                               phoneID: String?,
+                               known: [TrustedPhoneNumber],
+                               context: TwoFactorAuthContext) async throws -> PhoneCodeResponse
+    {
+        let sanitizedID: String = {
+            if let id = phoneID?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
                 return id
             }
             return "1"
         }()
 
-        let serverInfo: [String: any Sendable] = [
-            "mode": requestedMode,
-            "phoneNumber.id": sanitizedPhoneID
-        ]
+        var req = make2FARequest(url: Constants.URLs.phonePutURL(mode: mode), context: context)
+        req.httpMethod = "POST"
+        req.httpBody = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "serverInfo": ["mode": mode, "phoneNumber.id": sanitizedID]
+            ],
+            format: .xml, options: 0
+        )
 
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.phonePutURL(mode: requestedMode), context: context)
-        request.httpMethod = "POST"
-        request.httpBody = try PropertyListSerialization.data(fromPropertyList: [
-            "serverInfo": serverInfo
-        ], format: .xml, options: 0)
+        let (data, resp) = try await session.data(for: req)
+        let statusCode = (resp as? HTTPURLResponse)?.safeStatusCode ?? 0
+        try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendPhoneCode")
 
-        let (data, response) = try await session.data(for: request)
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.safeStatusCode ?? 0
+        let dict = parsePlistOrJSON(data)
+        let ec = dict?["ec"] as? Int ?? 0
+        let em = (dict?["em"] as? String)
+             ?? ((dict?["Status"] as? SendableDict)?["em"] as? String)
 
-        let rawStr = prettyJSONString(from: data)
-        verboseLog("[SideSign] sendPhone2FACodeRequest raw response (HTTP \(statusCode)): \(rawStr)")
-
-        try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendPhone2FACodeRequest")
-
-        let responseDict = parsePlistOrJSON(data)
-        let errorCode = responseDict?["ec"] as? Int ?? 0
-        let errorMsg = (responseDict?["em"] as? String)
-                   ?? ((responseDict?["Status"] as? [String: any Sendable])?["em"] as? String)
-
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
-            || statusCode == HTTPStatusCodes.tooManyRequests
-        {
-            let msg = errorMsg ?? "Verification codes cannot be sent to this phone number at this time. Please try again later."
-            debugLog("[SideSign] sendPhone2FACodeRequest rate-limited (\(errorCode), HTTP \(statusCode)): \(msg)")
-            throw DeveloperPortalError.tooManyAttempts(cause: msg)
-        } else if errorCode != 0 {
-            let msg = errorMsg ?? "Failed to request verification code from Apple."
-            debugLog("[SideSign] sendPhone2FACodeRequest error (\(errorCode), HTTP \(statusCode)): \(msg)")
-            throw ServerError.underlyingError(code: errorCode, message: msg)
+        if Self.isRateLimited(errorCode: ec, statusCode: statusCode) {
+            throw DeveloperPortalError.tooManyAttempts(cause: em ?? "Rate limited")
         }
-
+        if ec != 0 {
+            throw ServerError.underlyingError(code: ec, message: em ?? "Failed to request code")
+        }
         guard statusCode == HTTPStatusCodes.ok else {
-            let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
-            debugLog("[SideSign] sendPhone2FACodeRequest failed (HTTP \(statusCode)): \(reason)")
-            throw ServerError.badServerResponse(reason: reason, jsonPayload: rawStr)
+            throw ServerError.badServerResponse(
+                reason: em ?? HTTPStatusCodes.localizedDescription(for: statusCode),
+                jsonPayload: prettyJSONString(from: data)
+            )
         }
 
-        var parsedNumbers = parseTrustedPhoneNumbers(from: responseDict)
-        if parsedNumbers.isEmpty {
-            parsedNumbers = knownPhoneNumbers
-        }
-        let singlePhoneDict = responseDict?["phoneNumber"] as? [String: any Sendable]
-        let phoneListFirst = (responseDict?["phoneNumbers"] as? [[String: any Sendable]])?.first
-        let trustedPhoneListFirst = (responseDict?["trustedPhoneNumbers"] as? [[String: any Sendable]])?.first
-        let phoneDict = singlePhoneDict ?? phoneListFirst ?? trustedPhoneListFirst
-
-        let (xmluiServerPhoneID, xmluiServerMode) = parseXMLUIServerInfo(from: data)
-
-        let rawPhoneID = (phoneDict?["id"] as? CustomStringConvertible)?.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedPhoneID: String? = (rawPhoneID?.isEmpty == false) ? rawPhoneID : xmluiServerPhoneID
-        let resolvedRequestedID: String? = (requestedPhoneID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? requestedPhoneID : nil
-
-        let phoneID = resolvedPhoneID ?? resolvedRequestedID ?? parsedNumbers.first?.id ?? "1"
-        let activeMode = (phoneDict?["mode"] as? String) ?? xmluiServerMode ?? requestedMode
-
-        let numberWithDialCode = phoneDict?["numberWithDialCode"] as? String
-        let obfuscatedNumber = phoneDict?["obfuscatedNumber"] as? String
-        let lastTwoDigits = (phoneDict?["lastTwoDigits"] as? String).map { "••\($0)" }
-        let xmluiNumber = parseXMLUIObfuscatedNumber(from: data)
-        let matchedNumber = parsedNumbers.first(where: { $0.id == phoneID })?.number
-
-        let numberObfuscated = numberWithDialCode
-                            ?? obfuscatedNumber
-                            ?? lastTwoDigits
-                            ?? xmluiNumber
-                            ?? matchedNumber
-                            ?? ""
-        if let idx = parsedNumbers.firstIndex(where: { $0.id == phoneID }), !numberObfuscated.isEmpty {
-            parsedNumbers[idx] = TrustedPhoneNumber(id: phoneID, number: numberObfuscated)
-        } else if parsedNumbers.isEmpty && !numberObfuscated.isEmpty {
-            parsedNumbers = [TrustedPhoneNumber(id: phoneID, number: numberObfuscated)]
-        }
-        debugLog("[SideSign] sendPhone2FACodeRequest received phone response (id: \(phoneID), mode: \(activeMode), number: \(numberObfuscated), total phones: \(parsedNumbers.count))")
-
-        return TwoFactorAuthPhoneCodeResponse(
-            phoneID: phoneID,
-            activeMode: activeMode,
-            phoneNumbers: parsedNumbers,
-            statusCode: statusCode
+        return extractPhoneResponse(
+            from: dict ?? [:],
+            data: data,
+            known: known,
+            requestedID: phoneID,
+            requestedMode: mode
         )
     }
 
-    private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context)
-        verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
-
-        debugLog("[SideSign] Verifying trusted device security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
-        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
-        let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
-
-        return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: false, httpResponse: verifyHttpResponse)
-    }
-
-    private func validatePhone2FACode(code: String,
-                                      phoneID: String,
-                                      mode: String,
-                                      context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
+    private func extractPhoneResponse(from dict: SendableDict,
+                                      data: Data,
+                                      known: [TrustedPhoneNumber],
+                                      requestedID: String?,
+                                      requestedMode: String) -> PhoneCodeResponse
     {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context)
-        verifyRequest.httpMethod = "POST"
-        verifyRequest.httpBody = try PropertyListSerialization.data(fromPropertyList: [
-            "securityCode.code": code,
-            "serverInfo": ["mode": mode, "phoneNumber.id": phoneID]
-        ], format: .xml, options: 0)
+        var phones = parseTrustedPhoneNumbers(from: dict) ?? (known.isEmpty ? [] : known)
 
-        debugLog("[SideSign] Verifying secondary security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
-        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
-        let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
+        let single       = dict["phoneNumber"] as? SendableDict
+        let first        = (dict["phoneNumbers"] as? [SendableDict])?.first
+        let trustedFirst = (dict["trustedPhoneNumbers"] as? [SendableDict])?.first
+        let phoneDict    = single ?? first ?? trustedFirst
 
-        return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: true, httpResponse: verifyHttpResponse)
-    }
+        let (xmlID, xmlMode) = parseXMLUIServerInfo(from: data)
 
-    private func parseTwoFactorAuthVerifyResponse(data: Data,
-                                                  statusCode: Int,
-                                                  requirePeToken: Bool,
-                                                  httpResponse: HTTPURLResponse?) throws -> TwoFactorAuthValidationResult
-    {
-        let verifyDictionary = parsePlistOrJSON(data)
-        let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
-        let errorCode = verifyDictionary?["ec"] as? Int ?? 0
-        let statusDict = verifyDictionary?["Status"] as? [String: any Sendable]
-        let errorMsg = (verifyDictionary?["em"] as? String)
-                    ?? (statusDict?["em"] as? String)
-                    ?? xmluiMessage
-                    ?? xmluiTitle
+        let rawID = (phoneDict?["id"] as? CustomStringConvertible)?.description
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedID = (rawID?.isEmpty == false ? rawID : nil) ?? xmlID
+        let resolvedRequestedID = (requestedID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? requestedID : nil
 
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
-            || statusCode == HTTPStatusCodes.tooManyRequests
-        {
-            let msg = errorMsg ?? "Too many verification code attempts. Please try again later."
-            debugLog("[SideSign] Too many 2FA attempts (\(errorCode), HTTP \(statusCode)): \(msg)")
-            throw DeveloperPortalError.tooManyAttempts(cause: msg)
-        } else if errorCode == GrandSlamAuthErrorCodes.incorrectVerificationCode {
-            let msg = errorMsg ?? "Incorrect verification code. Please try again."
-            debugLog("[SideSign] Incorrect 2FA verification code (\(errorCode), HTTP \(statusCode)): \(msg)")
-            return .retry(message: msg)
-        } else if errorCode != 0 {
-            let msg = errorMsg ?? "2FA verification error"
-            debugLog("[SideSign] 2FA verification error (\(errorCode), HTTP \(statusCode)): \(msg)")
-            throw ServerError.underlyingError(code: errorCode, message: msg)
-        }
+        let phoneID = resolvedID ?? resolvedRequestedID ?? phones.first?.id ?? "1"
+        let activeMode = (phoneDict?["mode"] as? String) ?? xmlMode ?? requestedMode
 
-        if xmluiTitle != nil || xmluiMessage != nil {
-            let message = xmluiMessage ?? errorMsg ?? xmluiTitle ?? "Verification failed"
-            debugLog("[SideSign] 2FA verification fatal alert from Apple (HTTP \(statusCode)): \(message)")
-            throw DeveloperPortalError.invalid2FAResponse(cause: message)
-        }
+        let obfuscated = (phoneDict?["numberWithDialCode"] as? String)
+                      ?? (phoneDict?["obfuscatedNumber"] as? String)
+                      ?? (phoneDict?["lastTwoDigits"] as? String).map { "••\($0)" }
+                      ?? parseXMLUIObfuscatedNumber(from: data)
+                      ?? phones.first(where: { $0.id == phoneID })?.number
+                      ?? ""
 
-        guard statusCode == HTTPStatusCodes.ok else {
-            let rawStr = prettyJSONString(from: data)
-            let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
-            debugLog("[SideSign] 2FA verification failed (HTTP \(statusCode)): \(reason) - body: \(rawStr)")
-            return .retry(message: reason)
-        }
-
-        if requirePeToken {
-            guard httpResponse?.allHeaderFields.keys.contains(where: { ($0 as? String)?.lowercased() == "x-apple-pe-token" }) == true else {
-                let rawStr = prettyJSONString(from: data)
-                let reason = errorMsg ?? "Incorrect verification code or missing session token"
-                debugLog("[SideSign] Secondary code verification failed (HTTP \(HTTPStatusCodes.ok) missing PE token header): \(reason) - Body: \(rawStr)")
-                return .retry(message: reason)
+        if !obfuscated.isEmpty {
+            if let idx = phones.firstIndex(where: { $0.id == phoneID }) {
+                phones[idx] = TrustedPhoneNumber(id: phoneID, number: obfuscated)
+            } else {
+                phones.append(TrustedPhoneNumber(id: phoneID, number: obfuscated))
             }
         }
 
+        return PhoneCodeResponse(phoneID: phoneID, activeMode: activeMode, phoneNumbers: phones)
+    }
+
+    // MARK: - Validate Code
+
+    private func validatePhone(code: String,
+                               phoneID: String,
+                               mode: String,
+                               context: TwoFactorAuthContext) async throws -> ValidationResult
+    {
+        var req = make2FARequest(url: Constants.URLs.phoneSecurityCode, context: context)
+        req.httpMethod = "POST"
+        req.httpBody = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "securityCode.code": code,
+                "serverInfo": ["mode": mode, "phoneNumber.id": phoneID]
+            ],
+            format: .xml, options: 0
+        )
+
+        let (data, resp) = try await session.data(for: req)
+        return try parseVerifyResponse(
+            data: data,
+            statusCode: (resp as? HTTPURLResponse)?.safeStatusCode ?? 0,
+            requirePeToken: true,
+            response: resp as? HTTPURLResponse
+        )
+    }
+
+    private func parseVerifyResponse(data: Data,
+                                     statusCode: Int,
+                                     requirePeToken: Bool,
+                                     response: HTTPURLResponse?) throws -> ValidationResult
+    {
+        let dict = parsePlistOrJSON(data)
+        let (title, msg) = parseXMLUIAlertMessage(from: data)
+        let ec = dict?["ec"] as? Int ?? 0
+        let statusDict = dict?["Status"] as? SendableDict
+        let em = (dict?["em"] as? String)
+             ?? (statusDict?["em"] as? String)
+             ?? msg ?? title
+
+        if Self.isRateLimited(errorCode: ec, statusCode: statusCode) {
+            throw DeveloperPortalError.tooManyAttempts(cause: em ?? "Too many attempts")
+        }
+        if ec == GrandSlamAuthErrorCodes.incorrectVerificationCode {
+            return .retry(message: em ?? "Incorrect code")
+        }
+        if ec != 0 {
+            throw ServerError.underlyingError(code: ec, message: em ?? "2FA error")
+        }
+        if title != nil || msg != nil {
+            throw DeveloperPortalError.invalid2FAResponse(cause: msg ?? em ?? title ?? "Verification failed")
+        }
+        guard statusCode == HTTPStatusCodes.ok else {
+            return .retry(message: em ?? HTTPStatusCodes.localizedDescription(for: statusCode))
+        }
+
+        if requirePeToken,
+           response?.value(forHTTPHeaderField: "X-Apple-PE-Token") == nil {
+            return .retry(message: em ?? "Missing PE token")
+        }
         return .success
     }
 
-    private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext) -> URLRequest {
-        let identityToken = "\(context.dsid):\(context.idmsToken)"
-        let encodedIdentityToken = Data(identityToken.utf8).base64EncodedString()
+    private static func isRateLimited(errorCode: Int, statusCode: Int) -> Bool {
+        errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
+            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
+            || errorCode == GrandSlamAuthErrorCodes.rateLimited
+            || statusCode == HTTPStatusCodes.tooManyRequests
+    }
 
-        var request = URLRequest(url: url)
+    // MARK: - 2FA Request Builder
+
+    private func make2FARequest(url: URL, context: TwoFactorAuthContext) -> URLRequest {
+        let identity = "\(context.dsid):\(context.idmsToken)"
+        let encoded = Data(identity.utf8).base64EncodedString()
         let a = context.anisetteData
+
+        var req = URLRequest(url: url)
         let headers: [String: String] = [
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
@@ -873,7 +871,7 @@ public extension DeveloperPortal {
             "User-Agent": Constants.xcodeUserAgent,
             "X-Apple-App-Info": Constants.authApp,
             "X-Xcode-Version": context.xcodeVersion,
-            "X-Apple-Identity-Token": encodedIdentityToken,
+            "X-Apple-Identity-Token": encoded,
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
             "X-Mme-Device-Id": a.deviceID,
@@ -885,12 +883,103 @@ public extension DeveloperPortal {
             "X-Apple-Locale": a.locale,
             "X-Apple-I-TimeZone": a.timeZone
         ]
-        headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
-        return request
+        headers.forEach { req.setValue($1, forHTTPHeaderField: $0) }
+        return req
     }
 
-    private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {
-           (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: any Sendable]
-        ?? (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: any Sendable]
+    // MARK: - XML-UI Parsing
+
+    private func parseXMLUIAlertMessage(from data: Data) -> (title: String?, message: String?) {
+        guard let str = String(data: data, encoding: .utf8),
+              !str.contains("<pinView"),
+              let range = str.range(of: #"<alert(?![^>]*\bid=)[^>]*>"#, options: .regularExpression)
+        else { return (nil, nil) }
+
+        let tag = String(str[range])
+        let title = tag.firstMatch(#"(?<=title=")[^"]+"#)
+        let message = tag.firstMatch(#"(?<=message=")[^"]+"#)
+        return (title, message)
+    }
+
+    private func parseXMLUIServerInfo(from data: Data) -> (phoneID: String?, mode: String?) {
+        guard let str = String(data: data, encoding: .utf8),
+              let range = str.range(of: #"<serverInfo[^>]*>"#, options: .regularExpression)
+        else { return (nil, nil) }
+
+        let tag = String(str[range])
+        let id = tag.firstMatch(#"(?<=phoneNumber\.id=")[^"]+"#)
+        let mode = tag.firstMatch(#"(?<=mode=")[^"]+"#)
+        return (id, mode)
+    }
+
+    private func parseXMLUIObfuscatedNumber(from data: Data) -> String? {
+        guard let str = String(data: data, encoding: .utf8) else { return nil }
+        let patterns = [
+            #"(?:to|at)\s+([+•\d\s\(\)-]{4,25})[.\s<]"#,
+            #"([+•\d\s\(\)-]*[•]+[+•\d\s\(\)-]*)"#
+        ]
+        for pattern in patterns {
+            if let match = str.firstMatch(pattern) {
+                let cleaned = match
+                    .replacingOccurrences(of: "to ", with: "")
+                    .replacingOccurrences(of: "at ", with: "")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ". <\n\r\t"))
+                if cleaned.contains("•") && cleaned.count >= 3 { return cleaned }
+            }
+        }
+        return nil
+    }
+
+    private func throwIfXMLUIErrorAlert(in data: Data, statusCode: Int, actionName: String) throws {
+        let (title, message) = parseXMLUIAlertMessage(from: data)
+        guard title != nil || message != nil else { return }
+
+        let combined = [title, message]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ": ")
+        debugLog("[SideSign] \(actionName) alert (HTTP \(statusCode)): \(combined)")
+        throw DeveloperPortalError.invalid2FAResponse(cause: message ?? combined)
+    }
+
+    // MARK: - Phone Parsing
+
+    private func parseTrustedPhoneNumbers(from dict: SendableDict?) -> [TrustedPhoneNumber]? {
+        guard let dict else { return nil }
+
+        let list = (dict["trustedPhoneNumbers"] as? [SendableDict])
+                ?? (dict["phoneNumbers"] as? [SendableDict])
+                ?? []
+
+        var results = list.compactMap(Self.phoneNumber(from:))
+        if results.isEmpty,
+           let single = dict["phoneNumber"] as? SendableDict,
+           let phone = Self.phoneNumber(from: single) {
+            results = [phone]
+        }
+        return results.isEmpty ? nil : results
+    }
+
+    private static func phoneNumber(from item: SendableDict) -> TrustedPhoneNumber? {
+        guard let id = (item["id"] as? CustomStringConvertible)?.description
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty
+        else { return nil }
+
+        let number = (item["numberWithDialCode"] as? String)
+                  ?? (item["obfuscatedNumber"] as? String)
+                  ?? (item["lastTwoDigits"] as? String).map { "••\($0)" }
+                  ?? "Phone \(id)"
+        return TrustedPhoneNumber(id: id, number: number)
+    }
+}
+
+// MARK: - String Regex Helper
+
+private extension String {
+    /// Trả về match đầu tiên cho regex (không cần capture group).
+    func firstMatch(_ pattern: String) -> String? {
+        guard let range = range(of: pattern, options: .regularExpression) else { return nil }
+        return String(self[range])
     }
 }
