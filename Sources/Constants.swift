@@ -8,130 +8,176 @@
 
 import Foundation
 
+// MARK: - Protocol & Client
+
 public enum Constants {
+
+    // MARK: Protocol Versions
     public static let protocolVersion         = "QH65B2"
     public static let servicesProtocolVersion = "v1"
     public static let authProtocolVersion     = "A1234"
     public static let grandSlamAuthHeader     = "1.0.1"
-    public static let grandSlamService        = "iCloud"
-    public static let clientID                = "XABBG36SBA"
-    public static let appIDKey                = "ba2ec180e6ca6e6c6a542255453b24d6e6e5b2be0cc48bc1b0d8ad64cfe0228f"
-    public static let userAgent               = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)"
-    public static let authKitUserAgent        = "AuthKit/1 (Macintosh; OS X 26.6)"
-    public static let xcodeUserAgent          = "Xcode"
-    public static let authApp                 = "com.apple.gs.xcode.auth"
-    public static let defaultAccountRepairMessage = "Your Apple ID requires account verification or terms agreement.\n" + 
-                                                    "Please sign in to developer.apple.com or appleid.apple.com."
 
+    // MARK: Service Identity
+    public static let grandSlamService = "iCloud"
+    public static let clientID         = "XABBG36SBA"
+    public static let appIDKey         = "ba2ec180e6ca6e6c6a542255453b24d6e6e5b2be0cc48bc1b0d8ad64cfe0228f"
+    public static let authApp          = "com.apple.gs.xcode.auth"
+
+    // MARK: User Agents
+    public static let userAgent        = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.dt.Xcode/26.0)"
+    public static let authKitUserAgent = "AuthKit/1 (Macintosh; OS X 26.6)"
+    public static let xcodeUserAgent   = "Xcode"
+
+    // MARK: Messages
+    public static let defaultAccountRepairMessage =
+        "Your Apple ID requires account verification or terms agreement.\n" +
+        "Please sign in to developer.apple.com or appleid.apple.com."
+
+    // MARK: URL Namespace
     public enum URLs {
-        private static let servicesBase      = "https://developerservices2.apple.com/services/\(Constants.protocolVersion)"
 
-        // Auth
-        public static let developerAccount          = URL(string: "https://developer.apple.com/account")!
-        public static let developerServicesBase     = URL(string: "\(servicesBase)/")!
-        public static let developerServicesV1Base   = URL(string: "https://developerservices2.apple.com/services/\(Constants.servicesProtocolVersion)/")!
-        public static let appStoreConnectBase       = URL(string: "https://appstoreconnect.apple.com/iris/\(Constants.servicesProtocolVersion)/")!
-        public static let grandSlamAuth             = URL(string: "https://gsa.apple.com/grandslam/GsService2")!
-        public static let grandSlamLookup           = URL(string: "https://gsa.apple.com/grandslam/GsService2/lookup")!
-        public static let grandSlamValidate         = URL(string: "https://gsa.apple.com/grandslam/GsService2/validate")!
-        public static let trustedDevice             = URL(string: "https://gsa.apple.com/auth/verify/trusteddevice")!
-        public static let trustedDeviceSecurityCode = URL(string: "https://gsa.apple.com/auth/verify/trusteddevice/securitycode")!
-        public static let phoneBase                 = "https://gsa.apple.com/auth/verify/phone"
+        // MARK: Base hosts
+        fileprivate static let grandSlamHost = "https://gsa.apple.com"
+        fileprivate static let phoneBase     = "\(grandSlamHost)/auth/verify/phone"
+
+        fileprivate static let servicesBase  = "https://developerservices2.apple.com/services/\(Constants.protocolVersion)"
+        fileprivate static let servicesV1    = "https://developerservices2.apple.com/services/\(Constants.servicesProtocolVersion)"
+
+        // MARK: - Auth
+        public static let developerAccount = url("https://developer.apple.com/account")
+        public static let grandSlamAuth    = url("\(grandSlamHost)/grandslam/GsService2")
+        public static let grandSlamLookup  = url("\(grandSlamHost)/grandslam/GsService2/lookup")
+        public static let grandSlamValidate = url("\(grandSlamHost)/grandslam/GsService2/validate")
+
+        public static let trustedDevice             = url("\(grandSlamHost)/auth/verify/trusteddevice")
+        public static let trustedDeviceSecurityCode = url("\(grandSlamHost)/auth/verify/trusteddevice/securitycode")
+
+        public static let phoneSecurityCode = url("\(phoneBase)/securitycode?referrer=/auth/verify/phone/put")
+
         public static func phonePutURL(mode: String = "sms") -> URL {
-            URL(string: "\(phoneBase)/put?mode=\(mode)") ?? smsPut
+            url("\(phoneBase)/put?mode=\(mode)")
         }
-        public static let phoneSecurityCode         = URL(string: "\(phoneBase)/securitycode?referrer=/auth/verify/phone/put")!
-        public static let smsPut                    = URL(string: "https://gsa.apple.com/auth/verify/phone/put?mode=sms")!
-        public static let smsSecurityCode           = URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode?referrer=/auth/verify/phone/put")!
-        public static let appleAuthDevices          = URL(string: "https://idmsa.apple.com/appleauth/auth/devices")!
 
-        // Developer Portal Actions
-        public static let viewDeveloper             = URL(string: "\(servicesBase)/viewDeveloper.action")!
-        public static let listTeams                 = URL(string: "\(servicesBase)/listTeams.action")!
+        public static let appleAuthDevices = url("https://idmsa.apple.com/appleauth/auth/devices")
 
-        // iOS Actions
-        public static let listAppIDs                = URL(string: "\(servicesBase)/ios/listAppIds.action")!
-        public static let addAppID                  = URL(string: "\(servicesBase)/ios/addAppId.action")!
-        public static let updateAppID               = URL(string: "\(servicesBase)/ios/updateAppId.action")!
-        public static let deleteAppID               = URL(string: "\(servicesBase)/ios/deleteAppId.action")!
+        // MARK: - Developer Portal Base
+        public static let developerServicesBase   = url("\(servicesBase)/")
+        public static let developerServicesV1Base = url("\(servicesV1)/")
+        public static let appStoreConnectBase     = url("https://appstoreconnect.apple.com/iris/\(Constants.servicesProtocolVersion)/")
 
-        public static let listApplicationGroups     = URL(string: "\(servicesBase)/ios/listApplicationGroups.action")!
-        public static let addApplicationGroup       = URL(string: "\(servicesBase)/ios/addApplicationGroup.action")!
-        public static let updateApplicationGroup    = URL(string: "\(servicesBase)/ios/updateApplicationGroup.action")!
-        public static let assignApplicationGroup    = URL(string: "\(servicesBase)/ios/assignApplicationGroupToAppId.action")!
-        public static let deleteApplicationGroup    = URL(string: "\(servicesBase)/ios/deleteApplicationGroup.action")!
+        // MARK: - Developer Portal Actions
+        public static let viewDeveloper = url("\(servicesBase)/viewDeveloper.action")
+        public static let listTeams     = url("\(servicesBase)/listTeams.action")
 
-        public static let listDevices               = URL(string: "\(servicesBase)/ios/listDevices.action")!
-        public static let addDevice                 = URL(string: "\(servicesBase)/ios/addDevice.action")!
-        public static let updateDevice              = URL(string: "\(servicesBase)/ios/updateDevice.action")!
-        public static let disableDevice             = URL(string: "\(servicesBase)/ios/disableDevice.action")!
-        public static let deleteDevice              = URL(string: "\(servicesBase)/ios/deleteDevice.action")!
+        // MARK: - iOS: App IDs
+        public static let listAppIDs  = url("\(servicesBase)/ios/listAppIds.action")
+        public static let addAppID    = url("\(servicesBase)/ios/addAppId.action")
+        public static let updateAppID = url("\(servicesBase)/ios/updateAppId.action")
+        public static let deleteAppID = url("\(servicesBase)/ios/deleteAppId.action")
 
-        public static let listCertificates          = URL(string: "\(servicesBase)/ios/listAllDevelopmentCerts.action")!
-        public static let submitCSR                 = URL(string: "\(servicesBase)/ios/submitDevelopmentCSR.action")!
+        // MARK: - iOS: Application Groups
+        public static let listApplicationGroups  = url("\(servicesBase)/ios/listApplicationGroups.action")
+        public static let addApplicationGroup    = url("\(servicesBase)/ios/addApplicationGroup.action")
+        public static let updateApplicationGroup = url("\(servicesBase)/ios/updateApplicationGroup.action")
+        public static let assignApplicationGroup = url("\(servicesBase)/ios/assignApplicationGroupToAppId.action")
+        public static let deleteApplicationGroup = url("\(servicesBase)/ios/deleteApplicationGroup.action")
 
-        public static let listProvisioningProfiles          = URL(string: "\(servicesBase)/ios/listProvisioningProfiles.action")!
-        public static let downloadProvisioningProfile       = URL(string: "\(servicesBase)/ios/downloadTeamProvisioningProfile.action")!
-        public static let downloadManualProvisioningProfile = URL(string: "\(servicesBase)/ios/downloadProvisioningProfile.action")!
-        public static let createProvisioningProfile         = URL(string: "\(servicesBase)/ios/createProvisioningProfile.action")!
-        public static let regenProvisioningProfile          = URL(string: "\(servicesBase)/ios/regenProvisioningProfile.action")!
-        public static let deleteProvisioningProfile         = URL(string: "\(servicesBase)/ios/deleteProvisioningProfile.action")!
+        // MARK: - iOS: Devices
+        public static let listDevices    = url("\(servicesBase)/ios/listDevices.action")
+        public static let addDevice      = url("\(servicesBase)/ios/addDevice.action")
+        public static let updateDevice   = url("\(servicesBase)/ios/updateDevice.action")
+        public static let disableDevice  = url("\(servicesBase)/ios/disableDevice.action")
+        public static let deleteDevice   = url("\(servicesBase)/ios/deleteDevice.action")
 
-        // Anisette Endpoints
+        // MARK: - iOS: Certificates
+        public static let listCertificates = url("\(servicesBase)/ios/listAllDevelopmentCerts.action")
+        public static let submitCSR        = url("\(servicesBase)/ios/submitDevelopmentCSR.action")
+
+        // MARK: - iOS: Provisioning Profiles
+        public static let listProvisioningProfiles          = url("\(servicesBase)/ios/listProvisioningProfiles.action")
+        public static let downloadProvisioningProfile       = url("\(servicesBase)/ios/downloadTeamProvisioningProfile.action")
+        public static let downloadManualProvisioningProfile = url("\(servicesBase)/ios/downloadProvisioningProfile.action")
+        public static let createProvisioningProfile         = url("\(servicesBase)/ios/createProvisioningProfile.action")
+        public static let regenProvisioningProfile          = url("\(servicesBase)/ios/regenProvisioningProfile.action")
+        public static let deleteProvisioningProfile         = url("\(servicesBase)/ios/deleteProvisioningProfile.action")
+
+        // MARK: - Anisette
         public static let v3ClientInfo          = "v3/client_info"
         public static let v3GetHeaders          = "v3/get_headers"
         public static let v3ProvisioningSession = "v3/provisioning_session"
+
+        // MARK: - Helpers
+
+        /// Tạo URL từ chuỗi tĩnh (internal). Chỉ dùng cho literal biên dịch được.
+        /// - Note: Static và force-unwrap an toàn vì mọi literal đều đã được kiểm tra.
+        private static func url(_ string: String) -> URL {
+            guard let url = URL(string: string) else {
+                preconditionFailure("Invalid URL literal: \(string)")
+            }
+            return url
+        }
     }
 
+    // MARK: - Secondary Auth
     public enum SecondaryAuthType: String, Sendable, CaseIterable {
-        case secondaryAuth = "secondaryAuth"
-        case sms           = "sms"
-        case voice         = "voice"
-        case phone         = "phone"
+        case secondaryAuth
+        case sms
+        case voice
+        case phone
     }
 
-
+    // MARK: - Session Storage
     public enum Session {
-        public static let autoMagic: [UInt8]         = [0x53, 0x53, 0x30, 0x31] // "SS01"
-        public static let passMagic: [UInt8]         = [0x53, 0x53, 0x30, 0x32] // "SS02"
-        public static let saltLength                 = 16
-        public static let nonceLength                = 12
-        public static let tagLength                  = 16
-        public static let pbkdf2Rounds               = 100_000
-        public static let keyOutputLength            = 32
-        public static let defaultDirName             = "sidesign"
-        public static let defaultConfigDir           = ".config"
-        public static let sessionSubdirectory        = "session"
-        public static let defaultFileName            = "session.dat"
-        public static let filePrefix                 = "session_"
-        public static let fileExtension              = ".dat"
-        public static let machineSeedInfo            = "SideSign.AES-GCM.SessionStorageKey"
-        public static let machineSeedDomain          = "SideSign.Session.MachineSeed.v1"
-        public static let fallbackSeed               = "SideSignFallbackSeed"
-        public static let envXDGConfig               = "XDG_CONFIG_HOME"
-        public static let envAppData                 = "APPDATA"
-        public static let envHome                    = "HOME"
-        public static let envUser                    = "USER"
-        public static let envUsername                = "USERNAME"
+        public static let magicSS01: [UInt8] = Array("SS01".utf8) // auto
+        public static let magicSS02: [UInt8] = Array("SS02".utf8) // pass
+
+        public static let saltLength     = 16
+        public static let nonceLength    = 12
+        public static let tagLength      = 16
+        public static let pbkdf2Rounds   = 100_000
+        public static let keyOutputLength = 32
+
+        public static let defaultDirName    = "sidesign"
+        public static let defaultConfigDir  = ".config"
+        public static let sessionSubdirectory = "session"
+        public static let defaultFileName   = "session.dat"
+        public static let filePrefix        = "session_"
+        public static let fileExtension     = ".dat"
+
+        public static let machineSeedInfo   = "SideSign.AES-GCM.SessionStorageKey"
+        public static let machineSeedDomain = "SideSign.Session.MachineSeed.v1"
+        public static let fallbackSeed      = "SideSignFallbackSeed"
+
+        public static let envXDGConfig = "XDG_CONFIG_HOME"
+        public static let envAppData   = "APPDATA"
+        public static let envHome      = "HOME"
+        public static let envUser      = "USER"
+        public static let envUsername  = "USERNAME"
     }
 
+    // MARK: - Device Data
     public enum DeviceData {
-        public static let magic: [UInt8]             = [0x41, 0x44, 0x49, 0x31] // "ADI1"
-        public static let defaultFileName            = "machine.dat"
-        public static let filePrefix                 = "machine_"
-        public static let fileExtension              = ".dat"
+        public static let magicADID: [UInt8] = Array("ADI1".utf8)
+        public static let defaultFileName    = "machine.dat"
+        public static let filePrefix         = "machine_"
+        public static let fileExtension      = ".dat"
     }
 
+    // MARK: - Anisette Paths
     public enum Anisette {
-        public static let defaultBaseDirName          = ".sidesign"
-        public static let localLibsSubdirectory       = "local-libs"
-        public static let remoteLibsSubdirectory      = "remote-libs"
-        public static let provisioningSubdirectory    = "provisioning"
+        public static let defaultBaseDirName     = ".sidesign"
+        public static let localLibsSubdirectory  = "local-libs"
+        public static let remoteLibsSubdirectory = "remote-libs"
+        public static let provisioningSubdirectory = "provisioning"
+
         public static let cachingPollingDelayNanoseconds: UInt64 = 200_000_000
-        public static let remoteCacheDuration: TimeInterval = 30.0
-        public static let serverValidationTimeout: TimeInterval = 3.0
+        public static let remoteCacheDuration: TimeInterval      = 30.0
+        public static let serverValidationTimeout: TimeInterval  = 3.0
     }
 }
+
+// MARK: - Error Codes
 
 public enum GrandSlamAuthErrorCodes {
     public static let incorrectCredentials                = -22406
@@ -158,6 +204,8 @@ public enum DeveloperPortalResultCodes {
     public static let appIDDoesNotExistAlternate          = 8201
 }
 
+// MARK: - HTTP
+
 public enum HTTPStatusCodes {
     public static let ok                  = 200
     public static let noContent           = 204
@@ -173,29 +221,21 @@ public enum HTTPStatusCodes {
 
     public static func localizedDescription(for statusCode: Int) -> String {
         switch statusCode {
-        case badRequest:
-            return "The server rejected the request parameters."
-        case unauthorized:
-            return "Your sign-in session expired or is unauthorized."
-        case forbidden:
-            return "Access to this Apple Developer service was denied."
-        case notFound:
-            return "The requested Apple service endpoint could not be found."
-        case tooManyRequests:
-            return "Too many requests sent to Apple. Please wait a few moments and try again."
-        case internalServerError:
-            return "Apple's authentication servers encountered an internal error."
-        case badGateway:
-            return "Apple's servers received an invalid gateway response."
-        case serviceUnavailable:
-            return "Apple Developer Portal is temporarily unavailable or undergoing maintenance."
-        case gatewayTimeout:
-            return "Apple's servers took too long to respond (connection timed out)."
-        default:
-            return "Apple service returned an unexpected error (HTTP \(statusCode))."
+        case badRequest:          "The server rejected the request parameters."
+        case unauthorized:        "Your sign-in session expired or is unauthorized."
+        case forbidden:           "Access to this Apple Developer service was denied."
+        case notFound:            "The requested Apple service endpoint could not be found."
+        case tooManyRequests:     "Too many requests sent to Apple. Please wait a few moments and try again."
+        case internalServerError: "Apple's authentication servers encountered an internal error."
+        case badGateway:          "Apple's servers received an invalid gateway response."
+        case serviceUnavailable:  "Apple Developer Portal is temporarily unavailable or undergoing maintenance."
+        case gatewayTimeout:      "Apple's servers took too long to respond (connection timed out)."
+        default:                  "Apple service returned an unexpected error (HTTP \(statusCode))."
         }
     }
 }
+
+// MARK: - Device Family
 
 public enum UIDeviceFamilyCodes {
     public static let iPhone     = 1
@@ -205,4 +245,3 @@ public enum UIDeviceFamilyCodes {
     public static let mac        = 6
     public static let visionPro  = 7
 }
-
